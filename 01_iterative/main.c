@@ -167,9 +167,11 @@ int redis_incr_by(char *key, int incr_by) {
     char cmd_buf[1024] = "";
     char incr_by_str[16] = "";
     sprintf(incr_by_str, "%d", incr_by);
+    // MEMO: INCRBY keyname 1
     sprintf(cmd_buf, "*3\r\n$6\r\nINCRBY\r\n$%ld\r\n%s\r\n$%ld\r\n%d\r\n", strlen(key), key, strlen(incr_by_str), incr_by);
     write(redis_socket_fd, cmd_buf, strlen(cmd_buf));
     bzero(cmd_buf, sizeof(cmd_buf));
+    // MEMO: レスポンスにインクリメント後の値が入っているがあえて捨てている
     read(redis_socket_fd, cmd_buf, sizeof(cmd_buf));
     return 0;
 }
@@ -223,8 +225,16 @@ int redis_list_get_range(char *key, int start, int end, char ***items, int *item
     char cmd_buf[1024]="", start_str[16], end_str[16];
     sprintf(start_str, "%d", start);
     sprintf(end_str, "%d", end);
+    // MEMO: LRANGE keyname start end
     sprintf(cmd_buf, "*4\r\n$6\r\nLRANGE\r\n$%ld\r\n%s\r\n$%ld\r\n%s\r\n$%ld\r\n%s\r\n", strlen(key), key, strlen(start_str), start_str, strlen(end_str), end_str);
     write(redis_socket_fd, cmd_buf, strlen(cmd_buf));
+
+    // MEMO: サンプルレスポンス, 2 list
+    // *2 
+    // $10
+    // one - hoge
+    // $10
+    // two - hoge 
 
     /* Find out the length of the array */
     char ch;
@@ -233,6 +243,7 @@ int redis_list_get_range(char *key, int start, int end, char ***items, int *item
         return -1;
 
     int returned_items = 0;
+    // MEMO: リストの要素数は10を超えていたら1バイトではなくなるので複数readする必要がある
     while (1) {
         read(redis_socket_fd, &ch, 1);
         if (ch == '\r') {
@@ -245,6 +256,7 @@ int redis_list_get_range(char *key, int start, int end, char ***items, int *item
     /* Allocate the array that will hold a pointer each for
      * every element in the returned list */
     *items_count = returned_items;
+    // MEMO: char*の配列をリストのサイズ分確保している = calloc(returned_items, sizeof(char *))
     char **items_holder = malloc(sizeof(char *) * returned_items);
     *items = items_holder;
 
@@ -265,6 +277,7 @@ int redis_list_get_range(char *key, int start, int end, char ***items, int *item
             }
             str_size = (str_size * 10) + (ch - '0');
         }
+        // MEMO: 1要素分の文字列を確保, NULL文字を考慮して+1
         char *str = malloc(sizeof(char) * str_size + 1);
         items_holder[i] = str;
         read(redis_socket_fd, str, str_size);
@@ -281,6 +294,7 @@ int redis_list_get_range(char *key, int start, int end, char ***items, int *item
  * */
 
 int redis_get_list(char *key, char ***items, int *items_count) {
+    // MEMO: 「LRANGE 'key' 0 -1」でリストを全取得する
     return redis_list_get_range(key, 0, -1, items, items_count);
 }
 
@@ -553,14 +567,16 @@ int render_guestbook_template(int client_socket) {
     char visitor_count_str[16]="";
     redis_incr(GUESTBOOK_REDIS_VISITOR_KEY);
     redis_get_int_key(GUESTBOOK_REDIS_VISITOR_KEY, &visitor_count);
+    // MEMO: %'dだと3桁ごとにカンマ区切りを入れた文字列にしてくれる
     sprintf(visitor_count_str, "%'d", visitor_count);
 
     /* Replace guestbook entries */
+    // MEMO: 文字列を置換したいだけだが、標準にないので頑張って実装。。
     char *entries = strstr(templ, GUESTBOOK_TMPL_REMARKS);
     if (entries) {
-        memcpy(rendering, templ, entries-templ);
+        memcpy(rendering, templ, entries-templ); // 置換文字列より前をコピー
         strcat(rendering, guest_entries_html);
-        char *copy_offset = templ + (entries-templ) + strlen(GUESTBOOK_TMPL_REMARKS);
+        char *copy_offset = templ + (entries-templ) + strlen(GUESTBOOK_TMPL_REMARKS); // 置換文字列より後ろをcopy_offsetが差す
         strcat(rendering, copy_offset);
         strcpy(templ, rendering);
         bzero(rendering, sizeof(rendering));
@@ -592,6 +608,7 @@ int render_guestbook_template(int client_socket) {
     send(client_socket, send_buffer, strlen(send_buffer), 0);
     strcpy(send_buffer, "\r\n");
     send(client_socket, send_buffer, strlen(send_buffer), 0);
+    // MEMO: ここからresponse bodyを送る
     send(client_socket, templ, strlen(templ), 0);
     printf("200 GET /guestbook %ld bytes\n", strlen(templ));
 }
@@ -920,6 +937,7 @@ int main(int argc, char *argv[])
     setlocale(LC_NUMERIC, "");
     printf("ZeroHTTPd server listening on port %d\n", server_port);
     signal(SIGINT, print_stats);
+    // signal(SIGPIPE, SIG_IGN); // コネクションが切断された時に終了しないようにする
     enter_server_loop(server_socket);
     return (0);
 }
