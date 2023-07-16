@@ -33,6 +33,9 @@
 #define GUESTBOOK_TMPL_VISITOR      "$VISITOR_COUNT$"
 #define GUESTBOOK_TMPL_REMARKS      "$GUEST_REMARKS$"
 
+#define PREFORK_CHILDREN            50
+static pid_t pids[PREFORK_CHILDREN];
+
 /* MY */
 #define LISTEN_BACKLOG 10
 
@@ -66,7 +69,6 @@ const char *http_404_content = \
 
 int     redis_socket_fd;
 char    redis_host_ip[32];
-int     child_processes;
 
 /*
  One function that prints the system call and the error details
@@ -84,19 +86,14 @@ void fatal_error(const char *syscall)
  * to the Redis server and store the connected socket in a global variable.
  * */
 
-void connect_to_redis_server(char *redis_host) {
+void connect_to_redis_server() {
     struct sockaddr_in redis_servaddr;
     redis_socket_fd = socket(AF_INET, SOCK_STREAM, 0);
     bzero(&redis_servaddr, sizeof(redis_servaddr));
     redis_servaddr.sin_family = AF_INET;
     redis_servaddr.sin_port = htons(REDIS_SERVER_PORT);
 
-    int pton_ret;
-    if (!redis_host)
-        pton_ret = inet_pton(AF_INET, REDIS_SERVER_HOST, &redis_servaddr.sin_addr);
-    else
-        pton_ret = inet_pton(AF_INET, redis_host, &redis_servaddr.sin_addr);
-
+    int pton_ret = inet_pton(AF_INET, redis_host_ip, &redis_servaddr.sin_addr);
 
     if (pton_ret < 0)
         fatal_error("inet_pton()");
@@ -110,6 +107,8 @@ void connect_to_redis_server(char *redis_host) {
                         sizeof(redis_servaddr));
     if (cret == -1)
         fatal_error("redis connect()");
+    else
+        printf("Connected to Redis server@ %s:%d\n", REDIS_SERVER_HOST, REDIS_SERVER_PORT);
 }
 
 /*
@@ -874,16 +873,18 @@ void handle_client(int client_socket)
 
 /*
  * This function is the main server loop. It never returns. In a loop, it accepts client
- * connections and forks a child process. The parent goes back to blocking on accept()
- * so that it can accept more client connection requests. The child process calls 
- * handle_client() to serve the request. Once the request is served,
- * it closes the client connection and exits.
+ * connections and calls handle_client() to serve the request. Once the request is served,
+ * it closes the client connection and goes back to waiting for a new client connection,
+ * calling accept() again.
  * */
 
 void enter_server_loop(int server_socket)
 {
     struct sockaddr_in client_addr;
     socklen_t client_addr_len = sizeof(client_addr);
+    signal(SIGINT, SIG_IGN);
+    connect_to_redis_server();
+
     while (1)
     {
         int client_socket = accept(
@@ -892,25 +893,9 @@ void enter_server_loop(int server_socket)
                 &client_addr_len);
         if (client_socket == -1)
             fatal_error("accept()");
-        
-        int pid = fork();
-        if (pid == -1) {
-            close(client_socket);
-            fatal_error("fork()");
-        } else if (pid == 0) {
-            /* child process*/
-            close(server_socket); // close listening socket
-            connect_to_redis_server(redis_host_ip);
-
-            signal(SIGINT, SIG_DFL);
-
-            handle_client(client_socket);
-            close(client_socket);
-            exit(0);
-        } else {
-            /* parent process */
-            close(client_socket);
-        }
+    
+        handle_client(client_socket);
+        close(client_socket);
     }
 }
 
@@ -922,7 +907,7 @@ void enter_server_loop(int server_socket)
  * we print those. This helps us see how our server is performing.
  * */
 
-void print_stats(int signo) {
+void print_stats() {
     double          user, sys;
     struct rusage   myusage, childusage;
 
@@ -944,30 +929,40 @@ void print_stats(int signo) {
     exit(0);
 }
 
+void sigint_handler(int signo) {
+    printf("Signal handler called\n");
+    for (int i = 0; i < PREFORK_CHILDREN; i++)
+        kill(pids[i], SIGTERM);
+    while (wait(NULL) > 0);
+    print_stats();
+}
 
-void sigchld_handler(int signo) {
-    /* Let's call wait() for all children so that process accounting gets stats */
-    while (1) {
-        int wstatus;
-        pid_t pid = waitpid(-1, &wstatus, WNOHANG);
-        if (pid == 0 || pid == -1) // 成功 or エラー
-            break;
-        
-        child_processes++;
-    }
+pid_t create_child(int index, int listening_socket) {
+    pid_t pid;
+
+    pid = fork();
+    if (pid == -1)
+        fatal_error("fork()");
+    else if (pid > 0) /* Parent */
+        return (pid);
+    
+    printf("Server %d(pid: %ld) starting\n", index, (long) getpid());
+    enter_server_loop(listening_socket);
 }
 
 
 /*
  * Our main function is fairly simple. I sets up the listening socket, establishes
  * a connection to Redis, which we use to host our Guestbook app, sets up a signal
- * handler for SIGINT and finally calls enter_server_loop(), which accepts and
+ * handler for SIGINT and creates PREFORK_CHILDREN number of processes to handle.
+ * each of these processes call enter_server_loop(), which accepts and
  * serves client requests.
  * */
 
 int main(int argc, char *argv[])
 {
     int server_port;
+    signal(SIGINT, sigint_handler);
     if (argc > 1)
         server_port = atoi(argv[1]);
     else
@@ -985,16 +980,13 @@ int main(int argc, char *argv[])
 
     int server_socket = setup_listening_socket(server_port);
     printf("ZeroHTTPd server listening on port %d\n", server_port);
-    signal(SIGINT, print_stats);
-
-    /* setup the SIGCHLD handler with SA_RESTART */
-    struct sigaction sa;
-    sa.sa_handler = sigchld_handler;
-    sa.sa_flags = SA_RESTART;
-    sigfillset(&sa.sa_mask);
-    sigaction(SIGCHLD, &sa, NULL);
 
     signal(SIGPIPE, SIG_IGN); // コネクションが切断された時に終了しないようにする
-    enter_server_loop(server_socket);
-    return (0);
+
+    for (int i = 0; i < PREFORK_CHILDREN; i++)
+        pids[i] = create_child(i, server_socket);
+
+    // 親はここで待機
+    for (;;)
+        pause();
 }
