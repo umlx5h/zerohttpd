@@ -15,7 +15,6 @@
 #include <sys/time.h>
 #include <sys/resource.h>
 #include <sys/sendfile.h>
-#include <sys/wait.h>
 #include <time.h>
 #include <locale.h>
 
@@ -66,7 +65,6 @@ const char *http_404_content = \
 
 int     redis_socket_fd;
 char    redis_host_ip[32];
-int     child_processes;
 
 /*
  One function that prints the system call and the error details
@@ -84,19 +82,14 @@ void fatal_error(const char *syscall)
  * to the Redis server and store the connected socket in a global variable.
  * */
 
-void connect_to_redis_server(char *redis_host) {
+void connect_to_redis_server() {
     struct sockaddr_in redis_servaddr;
     redis_socket_fd = socket(AF_INET, SOCK_STREAM, 0);
     bzero(&redis_servaddr, sizeof(redis_servaddr));
     redis_servaddr.sin_family = AF_INET;
     redis_servaddr.sin_port = htons(REDIS_SERVER_PORT);
 
-    int pton_ret;
-    if (!redis_host)
-        pton_ret = inet_pton(AF_INET, REDIS_SERVER_HOST, &redis_servaddr.sin_addr);
-    else
-        pton_ret = inet_pton(AF_INET, redis_host, &redis_servaddr.sin_addr);
-
+    int pton_ret = inet_pton(AF_INET, redis_host_ip, &redis_servaddr.sin_addr);
 
     if (pton_ret < 0)
         fatal_error("inet_pton()");
@@ -110,6 +103,8 @@ void connect_to_redis_server(char *redis_host) {
                         sizeof(redis_servaddr));
     if (cret == -1)
         fatal_error("redis connect()");
+    else
+        printf("Connected to Redis server@ %s:%d\n", redis_host_ip, REDIS_SERVER_PORT);
 }
 
 /*
@@ -874,10 +869,9 @@ void handle_client(int client_socket)
 
 /*
  * This function is the main server loop. It never returns. In a loop, it accepts client
- * connections and forks a child process. The parent goes back to blocking on accept()
- * so that it can accept more client connection requests. The child process calls 
- * handle_client() to serve the request. Once the request is served,
- * it closes the client connection and exits.
+ * connections and calls handle_client() to serve the request. Once the request is served,
+ * it closes the client connection and goes back to waiting for a new client connection,
+ * calling accept() again.
  * */
 
 void enter_server_loop(int server_socket)
@@ -893,24 +887,24 @@ void enter_server_loop(int server_socket)
         if (client_socket == -1)
             fatal_error("accept()");
         
-        int pid = fork();
-        if (pid == -1) {
+        int childPID;
+        switch (childPID = fork()) {
+        case -1:
             close(client_socket);
             fatal_error("fork()");
-        } else if (pid == 0) {
-            /* child process*/
-            close(server_socket); // close listening socket
-            connect_to_redis_server(redis_host_ip);
 
-            signal(SIGINT, SIG_DFL);
-
+        case 0:
+            // child process
+            close(server_socket);
             handle_client(client_socket);
             close(client_socket);
-            exit(0);
-        } else {
-            /* parent process */
+            _exit(EXIT_SUCCESS);
+
+        default:
+            // parent process
             close(client_socket);
         }
+
     }
 }
 
@@ -923,40 +917,13 @@ void enter_server_loop(int server_socket)
  * */
 
 void print_stats(int signo) {
-    double          user, sys;
-    struct rusage   myusage, childusage;
-
-    if (getrusage(RUSAGE_SELF, &myusage) < 0)
-        fatal_error("getrusage()");
-    if (getrusage(RUSAGE_CHILDREN, &childusage) < 0)
-        fatal_error("getrusage()");
-
-    user = (double) myusage.ru_utime.tv_sec +
-                    myusage.ru_utime.tv_usec/1000000.0;
-    user += (double) childusage.ru_utime.tv_sec +
-                     childusage.ru_utime.tv_usec/1000000.0;
-    sys = (double) myusage.ru_stime.tv_sec +
-                   myusage.ru_stime.tv_usec/1000000.0;
-    sys += (double) childusage.ru_stime.tv_sec +
-                    childusage.ru_stime.tv_usec/1000000.0;
-
-    printf("\nuser time = %g, sys time = %g\n", user, sys);
+    struct rusage rusagebuf;
+    getrusage(RUSAGE_SELF, &rusagebuf);
+    printf("\nUser time: %lds %ldms, System time: %lds %ldms\n",
+            rusagebuf.ru_utime.tv_sec, rusagebuf.ru_utime.tv_usec/1000,
+            rusagebuf.ru_stime.tv_sec, rusagebuf.ru_stime.tv_usec/1000);
     exit(0);
 }
-
-
-void sigchld_handler(int signo) {
-    /* Let's call wait() for all children so that process accounting gets stats */
-    while (1) {
-        int wstatus;
-        pid_t pid = waitpid(-1, &wstatus, WNOHANG);
-        if (pid == 0 || pid == -1) // 成功 or エラー
-            break;
-        
-        child_processes++;
-    }
-}
-
 
 /*
  * Our main function is fairly simple. I sets up the listening socket, establishes
@@ -978,23 +945,19 @@ int main(int argc, char *argv[])
     else
         strcpy(redis_host_ip, REDIS_SERVER_HOST);
 
+    int server_socket = setup_listening_socket(server_port);
 
+    connect_to_redis_server();
     /* Setting the locale and using the %' escape sequence lets us format
      * numbers with commas */
     setlocale(LC_NUMERIC, "");
-
-    int server_socket = setup_listening_socket(server_port);
     printf("ZeroHTTPd server listening on port %d\n", server_port);
     signal(SIGINT, print_stats);
 
-    /* setup the SIGCHLD handler with SA_RESTART */
-    struct sigaction sa;
-    sa.sa_handler = sigchld_handler;
-    sa.sa_flags = SA_RESTART;
-    sigfillset(&sa.sa_mask);
-    sigaction(SIGCHLD, &sa, NULL);
+    // 子プロセスのゾンビ化を防ぐためにSIGCHLDを無視
+    signal(SIGCHLD, SIG_IGN);
 
-    signal(SIGPIPE, SIG_IGN); // コネクションが切断された時に終了しないようにする
+    // signal(SIGPIPE, SIG_IGN); // コネクションが切断された時に終了しないようにする
     enter_server_loop(server_socket);
     return (0);
 }

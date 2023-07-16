@@ -937,7 +937,7 @@ int main(int argc, char *argv[])
     setlocale(LC_NUMERIC, "");
     printf("ZeroHTTPd server listening on port %d\n", server_port);
     signal(SIGINT, print_stats);
-    // signal(SIGPIPE, SIG_IGN); // コネクションが切断された時に終了しないようにする
+    signal(SIGPIPE, SIG_IGN); // コネクションが切断された時に終了しないようにする
     enter_server_loop(server_socket);
     return (0);
 }
