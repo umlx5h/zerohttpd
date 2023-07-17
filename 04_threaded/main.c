@@ -15,8 +15,10 @@
 #include <sys/time.h>
 #include <sys/resource.h>
 #include <sys/sendfile.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <locale.h>
+#include <pthread.h>
 
 #define SERVER_STRING               "Server: zerohttpd/0.1\r\n"
 #define DEFAULT_SERVER_PORT         8000
@@ -63,8 +65,8 @@ const char *http_404_content = \
         "</body>"
         "</html>";
 
-int     redis_socket_fd;
-char    redis_host_ip[32];
+__thread int     redis_socket_fd;
+char             redis_host_ip[32];
 
 /*
  One function that prints the system call and the error details
@@ -802,14 +804,16 @@ void handle_post_method(char *path, int client_socket) {
 void handle_http_method(char *method_buffer, int client_socket)
 {
     // MEMO: method_bufferはスタックに確保されているがそれを参照するポインタ
-    char *method, *path;
+    char *method, *path, *saveptr;
 
     // MEMO: GET /hello HTTP/1.1 -> GET
-    method = strtok(method_buffer, " ");
+    
+    // MEMO: strtokはthread safeではないので、strtok_rを利用する
+    method = strtok_r(method_buffer, " ", &saveptr);
     strtolower(method);
     // MEMO: NULLを渡すことで /helloから始まることができる
     // MEMO: GET /hello\0HTTP/1.1 -> /hello
-    path = strtok(NULL, " ");
+    path = strtok_r(NULL, " ", &saveptr);
 
     if (strcmp(method, "get") == 0)
     {
@@ -831,11 +835,19 @@ void handle_http_method(char *method_buffer, int client_socket)
  * are read and discarded since we do not deal with them.
  * */
 
-void handle_client(int client_socket)
+void *handle_client(void *targ)
 {
     char line_buffer[1024];
     char method_buffer[1024];
     int method_line = 0;
+    int client_socket = (long) targ;
+
+    /* No one needs to do a pthread_join() for the OS to free up this thread's resources */
+    pthread_detach(pthread_self());
+
+    // int redis_server_socket;
+    // connect_to_redis_server(&redis_server_socket);
+    connect_to_redis_server();
 
     while (1)
     {
@@ -853,7 +865,7 @@ void handle_client(int client_socket)
         if (method_line == 1)
         {
             if (len == 0)
-                return;
+                return (NULL);
 
             strcpy(method_buffer, line_buffer);
         }
@@ -865,19 +877,25 @@ void handle_client(int client_socket)
     }
 
     handle_http_method(method_buffer, client_socket);
+
+    close(client_socket);
+    close(redis_socket_fd);
+    return(NULL);
 }
 
 /*
  * This function is the main server loop. It never returns. In a loop, it accepts client
- * connections and calls handle_client() to serve the request. Once the request is served,
- * it closes the client connection and goes back to waiting for a new client connection,
- * calling accept() again.
+ * connections and creates a new thread to handle every new request. The new thread 
+ * starts with handle_client() to serve the request. Once the request is served,
+ * it closes the client connection exits.
  * */
 
 void enter_server_loop(int server_socket)
 {
     struct sockaddr_in client_addr;
     socklen_t client_addr_len = sizeof(client_addr);
+    pthread_t tid;
+
     while (1)
     {
         int client_socket = accept(
@@ -886,9 +904,9 @@ void enter_server_loop(int server_socket)
                 &client_addr_len);
         if (client_socket == -1)
             fatal_error("accept()");
-
-        handle_client(client_socket);
-        close(client_socket);
+        
+        // MEMO: intを値として渡す
+        pthread_create(&tid, NULL, handle_client, (void *)(intptr_t) client_socket);
     }
 }
 
@@ -900,12 +918,19 @@ void enter_server_loop(int server_socket)
  * we print those. This helps us see how our server is performing.
  * */
 
-void print_stats(int signo) {
-    struct rusage rusagebuf;
-    getrusage(RUSAGE_SELF, &rusagebuf);
-    printf("\nUser time: %lds %ldms, System time: %lds %ldms\n",
-            rusagebuf.ru_utime.tv_sec, rusagebuf.ru_utime.tv_usec/1000,
-            rusagebuf.ru_stime.tv_sec, rusagebuf.ru_stime.tv_usec/1000);
+void print_stats() {
+    double          user, sys;
+    struct rusage   myusage;
+
+    if (getrusage(RUSAGE_SELF, &myusage) < 0)
+        fatal_error("getrusage()");
+
+    user = (double) myusage.ru_utime.tv_sec +
+                    myusage.ru_utime.tv_usec/1000000.0;
+    sys = (double) myusage.ru_stime.tv_sec +
+                   myusage.ru_stime.tv_usec/1000000.0;
+
+    printf("\nuser time = %g, sys time = %g\n", user, sys);
     exit(0);
 }
 
@@ -913,7 +938,7 @@ void print_stats(int signo) {
  * Our main function is fairly simple. I sets up the listening socket, establishes
  * a connection to Redis, which we use to host our Guestbook app, sets up a signal
  * handler for SIGINT and finally calls enter_server_loop(), which accepts and
- * serves client requests.
+ * serves client requests, each one in a new thread.
  * */
 
 int main(int argc, char *argv[])
@@ -931,7 +956,6 @@ int main(int argc, char *argv[])
 
     int server_socket = setup_listening_socket(server_port);
 
-    connect_to_redis_server();
     /* Setting the locale and using the %' escape sequence lets us format
      * numbers with commas */
     setlocale(LC_NUMERIC, "");
