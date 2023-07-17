@@ -34,6 +34,12 @@
 #define GUESTBOOK_TMPL_VISITOR      "$VISITOR_COUNT$"
 #define GUESTBOOK_TMPL_REMARKS      "$GUEST_REMARKS$"
 
+#define THREADS_COUNT 100
+pthread_t threads[THREADS_COUNT];
+
+int server_socket;
+pthread_mutex_t mlock = PTHREAD_MUTEX_INITIALIZER; /* Protect accept() */
+
 /* MY */
 #define LISTEN_BACKLOG 10
 
@@ -835,18 +841,21 @@ void handle_http_method(char *method_buffer, int client_socket)
  * are read and discarded since we do not deal with them.
  * */
 
-void *handle_client(void *targ)
+void handle_client(int client_socket)
 {
     char line_buffer[1024];
     char method_buffer[1024];
     int method_line = 0;
-    int client_socket = (long) targ;
+    
+    /**
+     * Setup a timeout on recv() on the client socket
+     * 
+     */
+    struct timeval tv;
+    tv.tv_sec = 5;
+    tv.tv_usec = 0;
+    setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
 
-    /* No one needs to do a pthread_join() for the OS to free up this thread's resources */
-    pthread_detach(pthread_self());
-
-    // int redis_server_socket;
-    // connect_to_redis_server(&redis_server_socket);
     connect_to_redis_server();
 
     while (1)
@@ -865,7 +874,7 @@ void *handle_client(void *targ)
         if (method_line == 1)
         {
             if (len == 0)
-                return (NULL);
+                return;
 
             strcpy(method_buffer, line_buffer);
         }
@@ -880,17 +889,20 @@ void *handle_client(void *targ)
 
     close(client_socket);
     close(redis_socket_fd);
-    return(NULL);
+    return;
 }
 
 /*
  * This function is the main server loop. It never returns. In a loop, it accepts client
- * connections and creates a new thread to handle every new request. The new thread 
- * starts with handle_client() to serve the request. Once the request is served,
- * it closes the client connection exits.
+ * connections and calls handle_client() to serve the request. Once the request is served,
+ * it closes the client connection and goes back to waiting for a new client connection,
+ * calling accept() again.
+ * Here, the call to accept() is protected with a mutex so that only one thread in the 
+ * thread pool can actually be blocked in accept(). This is to avoid the thundering herd
+ * problem that supposedly affects some versions of Unix operating systems.
  * */
 
-void enter_server_loop(int server_socket)
+void *enter_server_loop(void *targ)
 {
     struct sockaddr_in client_addr;
     socklen_t client_addr_len = sizeof(client_addr);
@@ -898,16 +910,21 @@ void enter_server_loop(int server_socket)
 
     while (1)
     {
-        int client_socket = accept(
+        pthread_mutex_lock(&mlock);
+        long client_socket = accept(
                 server_socket,
                 (struct sockaddr *)&client_addr,
                 &client_addr_len);
         if (client_socket == -1)
             fatal_error("accept()");
-        
-        // MEMO: intを値として渡す
-        pthread_create(&tid, NULL, handle_client, (void *)(intptr_t) client_socket);
+        pthread_mutex_unlock(&mlock);
+
+        handle_client(client_socket);
     }
+}
+
+void create_thread(int index) {
+    pthread_create(&threads[index], NULL, enter_server_loop, NULL);
 }
 
 /*
@@ -918,7 +935,7 @@ void enter_server_loop(int server_socket)
  * we print those. This helps us see how our server is performing.
  * */
 
-void print_stats() {
+void print_stats(int signo) {
     double          user, sys;
     struct rusage   myusage;
 
@@ -935,12 +952,10 @@ void print_stats() {
 }
 
 /*
- * Our main function is fairly simple. I sets up the listening socket, establishes
- * a connection to Redis, which we use to host our Guestbook app, sets up a signal
- * handler for SIGINT and finally calls enter_server_loop(), which accepts and
- * serves client requests, each one in a new thread.
+ * Our main function is fairly simple. I sets up the listening socket and then
+ * crates THREAD_COUNT number of threads to handle incoming requests. The main 
+ * thread does nothing, just calling pause() in an infinite loop.
  * */
-
 int main(int argc, char *argv[])
 {
     int server_port;
@@ -954,14 +969,18 @@ int main(int argc, char *argv[])
     else
         strcpy(redis_host_ip, REDIS_SERVER_HOST);
 
-    int server_socket = setup_listening_socket(server_port);
-
+    signal(SIGPIPE, SIG_IGN); // コネクションが切断された時に終了しないようにする
+    signal(SIGINT, print_stats);
     /* Setting the locale and using the %' escape sequence lets us format
      * numbers with commas */
     setlocale(LC_NUMERIC, "");
     printf("ZeroHTTPd server listening on port %d\n", server_port);
-    signal(SIGINT, print_stats);
-    signal(SIGPIPE, SIG_IGN); // コネクションが切断された時に終了しないようにする
-    enter_server_loop(server_socket);
-    return (0);
+
+    server_socket = setup_listening_socket(server_port);
+    for (int i = 0; i < THREADS_COUNT; i++) {
+        create_thread(i);
+    }
+
+    for (;;)
+        pause();
 }
