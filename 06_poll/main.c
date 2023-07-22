@@ -19,6 +19,7 @@
 #include <locale.h>
 #include <poll.h>
 #include <errno.h>
+#include "uthash.h"
 
 #define SERVER_STRING               "Server: zerohttpd/0.1\r\n"
 #define DEFAULT_SERVER_PORT         8000
@@ -86,10 +87,18 @@ typedef struct client_context{
     /* Next callback to make to render the page */
     void (*next_callback)(struct client_context *cc);
 
+    /* Used by Redis reader/writer callback functions */
+    void (*read_write_callback)(struct client_context *cc);
 
+    int entries_count;
+    char **entries;
+    char redis_key_buffer[64];
+    int intval;
+
+    /* Hash tables handles to look up by Redis or by client socket */
+    UT_hash_handle hh_cs;  /* Lookup by client socket */
+    UT_hash_handle hh_rs;  /* Lookup by Redis socket */
 } client_context;
-
-
 
 /*
  * These are the 2 variables that poll() uses to present the set of file
@@ -99,6 +108,12 @@ typedef struct client_context{
 struct pollfd poll_fds[POLL_FDS_SZ];
 nfds_t poll_nfds;
 
+/*
+ * Hash tables that allow us to look up the client_context
+ * given the client socket or the Redis socket respectively.
+ * */
+client_context *cc_cs_hash = NULL;
+client_context *cc_rs_hash = NULL;
 
 
 void add_to_poll_fd_list(int fd, short int events) {
@@ -146,14 +161,15 @@ void fatal_error(const char *syscall)
 /*
  * Redis uses a long-lived connection. Many commands are sent on and
  * responded to over the same connection. In this function, we connect
- * to the Redis server and store the connected socket in a global variable.
+ * to the Redis server and return the connected socket.
+ *
+ * This is the synchronous version of the connect_to_redis() function.
  * */
 
-// TODO: delete this
-void connect_to_redis_server_old() {
+int connect_to_redis_server_sync() {
     struct sockaddr_in redis_servaddr;
     int redis_socket_fd = socket(AF_INET, SOCK_STREAM, 0);
-    bzero(&redis_servaddr, sizeof(redis_servaddr));
+    memset(&redis_servaddr, 0, sizeof(redis_servaddr));
     redis_servaddr.sin_family = AF_INET;
     redis_servaddr.sin_port = htons(REDIS_SERVER_PORT);
 
@@ -171,8 +187,8 @@ void connect_to_redis_server_old() {
                         sizeof(redis_servaddr));
     if (cret == -1)
         fatal_error("redis connect()");
-    else
-        printf("Connected to Redis server@ %s:%d\n", redis_host_ip, REDIS_SERVER_PORT);
+
+    return redis_socket_fd;
 }
 
 /*
@@ -253,38 +269,29 @@ void connect_to_redis_server(client_context *cc) {
         cc->read_write_callback = connect_to_redis_server_callback;
         add_to_poll_fd_list(redis_socket_fd, POLLOUT);
     }
-
 }
 
 
 
 /*
- * This is an internal function not to be used directly. It send the command to the server,
- * but reads back the raw server response. Not very useful to be used directly without
- * first processing it to extract the required data.
+ * One note about writes: we never check if we will block. We simply
+ * write. We mainly worry about the time we might spend blocked on
+ * connect() and read(). Both these, we track with poll()
  * */
-
-int _redis_get_key(const char *key, char *value_buffer, int value_buffer_sz) {
-    char *req_buffer;
-    /*
-     * asprintf() is a useful GNU extension that allocates the string as required.
-     * No more guessing the right size for the buffer that holds the string.
-     * Don't forget to call free() once you're done.
-     * */
-    asprintf(&req_buffer, "*2\r\n$3\r\nGET\r\n$%ld\r\n%s\r\n", strlen(key), key);
-    write(redis_socket_fd, req_buffer, strlen(req_buffer));
-    free(req_buffer);
-    read(redis_socket_fd, value_buffer, value_buffer_sz);
-    return 0;
+ssize_t redis_write(int fd, char *buf, ssize_t length) {
+    ssize_t n_written = write(fd, buf, length);
+    if (n_written < 0)
+        fatal_error("Redis write()");
+    
+    return n_written;
 }
 
 /*
- * Given the key, fetched the number value associated with it.
- * If we know that a key is indeed a number, use this function. The server sends back
- * numbers are strings, but we convert them and provide them in a number format.
+ * We are expecting to read and fetch an integer from Redis. This callback
+ * is made when we can read without blocking on the Redis socket.
  * */
 
-int redis_get_int_key(const char *key, int *value) {
+void redis_get_int_key_callback(client_context *cc) {
     /*
      * Example response from server:
      * $3\r\n385\r\n
@@ -292,12 +299,17 @@ int redis_get_int_key(const char *key, int *value) {
      * of 3 characters.
      */
 
-    /* Shortcut: setting a character array to a null string will fill it up with zeros */
-    char redis_response[64] = "";
-    _redis_get_key(key, redis_response, sizeof(redis_response));
-    char *p = redis_response;
-    if (*p != '$')
-        return -1;
+    /* memset needed only if we're printing the read buffer */
+    //memset(cc->redis_key_buffer, 0, sizeof(cc->redis_key_buffer));
+
+    int ret = read(cc->redis_sock, cc->redis_key_buffer, sizeof(cc->redis_key_buffer));
+    if (ret < 0) fatal_error("Redis read()");
+
+    char *p = cc->redis_key_buffer;
+    if (*p != '$') {
+        printf("Redis protocol error. Wrong number format\n");
+        return;
+    }
 
     /* Loop till we reach the actual number string */
     while(*p++ != '\n');
@@ -308,52 +320,73 @@ int redis_get_int_key(const char *key, int *value) {
         intval = (intval * 10) + (*p - '0');
         p++;
     }
-    *value = intval;
+    cc->intval = intval;
+    cc->next_callback(cc);
+}
 
-    return 0;
+
+/*
+ * Initiate reading a key with an int value from Redis. See the
+ * redis_get_int_key_callback() function above. That gets called from
+ * the event loop once we can read the Redis socket without blocking.
+ * */
+
+void redis_get_int_key(const char *key, client_context *cc) {
+    char *req_buffer;
+    asprintf(&req_buffer, "*2\r\n$3\r\nGET\r\n$%ld\r\n%s\r\n", strlen(key), key);
+    redis_write(cc->redis_sock, req_buffer, strlen(req_buffer));
+    free(req_buffer);
+
+    cc->read_write_callback = redis_get_int_key_callback;
+}
+
+void redis_incr_by_callback(client_context *cc) {
+    /*
+     * Redis returns the new increased count. If this is not read here,
+     * it interferes with future reads.
+     * */
+
+    char cmd_buf[1024] = "";
+    ssize_t r_ret = read(cc->redis_sock, cmd_buf, sizeof(cmd_buf));
+    if (r_ret < 0)
+        fatal_error("Redis incr_cb read()");
+    cc->next_callback(cc);
 }
 
 /* Increment given key by incr_by. Key is created by Redis if it doesn't exist. */
-int redis_incr_by(char *key, int incr_by) {
+void redis_incr_by(char *key, int incr_by, client_context *cc) {
     char cmd_buf[1024] = "";
     char incr_by_str[16] = "";
     sprintf(incr_by_str, "%d", incr_by);
     // MEMO: INCRBY keyname 1
     sprintf(cmd_buf, "*3\r\n$6\r\nINCRBY\r\n$%ld\r\n%s\r\n$%ld\r\n%d\r\n", strlen(key), key, strlen(incr_by_str), incr_by);
-    write(redis_socket_fd, cmd_buf, strlen(cmd_buf));
-    bzero(cmd_buf, sizeof(cmd_buf));
-    // MEMO: レスポンスにインクリメント後の値が入っているがあえて捨てている
-    read(redis_socket_fd, cmd_buf, sizeof(cmd_buf));
-    return 0;
+    redis_write(cc->redis_sock, cmd_buf, strlen(cmd_buf));
+    cc->read_write_callback = redis_incr_by_callback;
 }
 
 /* Implies increment by one. Useful addition since this is a common use case. */
-int redis_incr(char *key) {
-    return redis_incr_by(key, 1);
+void redis_incr(char *key, client_context *cc) {
+    return redis_incr_by(key, 1, cc);
 }
 
 /*
  * Appends an item pointed to by 'value' to the list in redis referred by 'key'.
  * Uses the Redis RPUSH command to get the job done.
+ *
+ * This call is made rarely and so we read synchronously.
  * */
 
-int redis_list_append(char *key, char *value) {
+
+int redis_list_append(char *key, char *value, int redis_socket_fd) {
     char cmd_buf[1024] = "";
     sprintf(cmd_buf, "*3\r\n$5\r\nRPUSH\r\n$%ld\r\n%s\r\n$%ld\r\n%s\r\n", strlen(key), key, strlen(value), value);
-    write(redis_socket_fd, cmd_buf, strlen(cmd_buf));
-    bzero(cmd_buf, sizeof(cmd_buf));
+    redis_write(redis_socket_fd, cmd_buf, strlen(cmd_buf));
+    memset(cmd_buf, 0, sizeof(cmd_buf));
     read(redis_socket_fd, cmd_buf, sizeof(cmd_buf));
     return 0;
 }
 
-/*
- * Get the range of items in a list from 'start' to 'end'.
- * This function allocates memory. An array of pointers and all the strings pointed to by it
- * are dynamically allocated. redis_free_array_results() has to be called to free this
- * allocated memory by the caller.
- * */
-
-int redis_list_get_range(char *key, int start, int end, char ***items, int *items_count) {
+void redis_list_get_range_callback(client_context *cc) {
     /*
      *  The Redis protocol is elegantly simple. The following is a response for an array
      *  that has 3 elements (strings):
@@ -372,14 +405,7 @@ int redis_list_get_range(char *key, int start, int end, char ***items, int *item
      *  A '\r\n' (carriage return + line feed) sequence is used as the delimiter.
      *  Now, you should be able to understand why we're doing what we're doing in this function
      * */
-
-    char cmd_buf[1024]="", start_str[16], end_str[16];
-    sprintf(start_str, "%d", start);
-    sprintf(end_str, "%d", end);
-    // MEMO: LRANGE keyname start end
-    sprintf(cmd_buf, "*4\r\n$6\r\nLRANGE\r\n$%ld\r\n%s\r\n$%ld\r\n%s\r\n$%ld\r\n%s\r\n", strlen(key), key, strlen(start_str), start_str, strlen(end_str), end_str);
-    write(redis_socket_fd, cmd_buf, strlen(cmd_buf));
-
+    
     // MEMO: サンプルレスポンス, 2 list
     // *2 
     // $10
@@ -389,27 +415,27 @@ int redis_list_get_range(char *key, int start, int end, char ***items, int *item
 
     /* Find out the length of the array */
     char ch;
-    read(redis_socket_fd, &ch, 1);
+    read(cc->redis_sock, &ch, 1);
     if (ch != '*')
-        return -1;
+        return;
 
     int returned_items = 0;
     // MEMO: リストの要素数は10を超えていたら1バイトではなくなるので複数readする必要がある
     while (1) {
-        read(redis_socket_fd, &ch, 1);
+        read(cc->redis_sock, &ch, 1);
         if (ch == '\r') {
             /* Read the next '\n' character */
-            read(redis_socket_fd, &ch, 1);
+            read(cc->redis_sock, &ch, 1);
             break;
         }
         returned_items = (returned_items * 10) + (ch - '0');
     }
     /* Allocate the array that will hold a pointer each for
      * every element in the returned list */
-    *items_count = returned_items;
+    cc->entries_count = returned_items;
     // MEMO: char*の配列をリストのサイズ分確保している = calloc(returned_items, sizeof(char *))
     char **items_holder = malloc(sizeof(char *) * returned_items);
-    *items = items_holder;
+    cc->entries = items_holder;
 
     /*
      * We now know the length of the array. Let's loop that many iterations
@@ -417,13 +443,13 @@ int redis_list_get_range(char *key, int start, int end, char ***items, int *item
      * */
     for (int i = 0; i < returned_items; i++) {
         /* read the first '$' */
-        read(redis_socket_fd, &ch, 1);
+        read(cc->redis_sock, &ch, 1);
         int str_size = 0;
         while (1) {
-            read(redis_socket_fd, &ch, 1);
+            read(cc->redis_sock, &ch, 1);
             if (ch == '\r') {
                 /* Read the next '\n' character */
-                read(redis_socket_fd, &ch, 1);
+                read(cc->redis_sock, &ch, 1);
                 break;
             }
             str_size = (str_size * 10) + (ch - '0');
@@ -431,12 +457,33 @@ int redis_list_get_range(char *key, int start, int end, char ***items, int *item
         // MEMO: 1要素分の文字列を確保, NULL文字を考慮して+1
         char *str = malloc(sizeof(char) * str_size + 1);
         items_holder[i] = str;
-        read(redis_socket_fd, str, str_size);
+        read(cc->redis_sock, str, str_size);
         str[str_size] = '\0';
         /* Read the '\r\n' chars */
-        read(redis_socket_fd, &ch, 1);
-        read(redis_socket_fd, &ch, 1);
+        read(cc->redis_sock, &ch, 1);
+        read(cc->redis_sock, &ch, 1);
     }
+
+    cc->next_callback(cc);
+}
+
+/*
+ * Get the range of items in a list from 'start' to 'end'.
+ * This function allocates memory. An array of pointers and all the strings pointed to by it
+ * are dynamically allocated. redis_free_array_results() has to be called to free this
+ * allocated memory by the caller.
+ * */
+
+void redis_list_get_range(char *key, int start, int end, client_context *cc) {
+    /* Shortcut: setting a character array to a null string will fill it up with zeros */
+    char cmd_buf[1024]="", start_str[16], end_str[16];
+    sprintf(start_str, "%d", start);
+    sprintf(end_str, "%d", end);
+    // MEMO: LRANGE keyname start end
+    sprintf(cmd_buf, "*4\r\n$6\r\nLRANGE\r\n$%ld\r\n%s\r\n$%ld\r\n%s\r\n$%ld\r\n%s\r\n", strlen(key), key, strlen(start_str), start_str, strlen(end_str), end_str);
+
+    redis_write(cc->redis_sock, cmd_buf, strlen(cmd_buf));
+    cc->read_write_callback = redis_list_get_range_callback;
 }
 
 /*
@@ -444,9 +491,9 @@ int redis_list_get_range(char *key, int start, int end, char ***items, int *item
  * We set start to 0 and end to -1, which is a magic number that means the last element.
  * */
 
-int redis_get_list(char *key, char ***items, int *items_count) {
+void redis_get_list(char *key, client_context *cc) {
     // MEMO: 「LRANGE 'key' 0 -1」でリストを全取得する
-    return redis_list_get_range(key, 0, -1, items, items_count);
+    redis_list_get_range(key, 0, -1, cc);
 }
 
 /*
@@ -455,7 +502,7 @@ int redis_get_list(char *key, char ***items, int *items_count) {
  * holds pointers to those strings.
  * */
 
-int redis_free_array_result(char **items, int length) {
+void redis_free_array_result(char **items, int length) {
     for (int i = 0; i < length; i++) {
         free(items[i]);
     }
@@ -690,84 +737,124 @@ void send_headers(const char *path, off_t len, int client_socket) {
 }
 
 /*
- * The guest book template file is a normal HTML file except two special strings:
- * $GUEST_REMARKS$ and $VISITOR_COUNT$
- * In this method, both these special template variables are replaced by content
- * generated by us. And that content is based on stuff we retrieve from Redis.
+ * This is the last function called by the call chain and this is called when
+ * we're done dealing with a client request. We remove the client and Redis
+ * sockets from the list that poll() deals with and we also remove the
+ * client_context entries from both the hash tables we're using. We close both
+ * sockets and finally free the memory we allocated for the client_context.
  * */
 
-int render_guestbook_template(int client_socket) {
-    char templ[16384]="";
-    char rendering[16384]="";
-
-    /* Read the template file */
-    int fd = open(GUESTBOOK_TEMPLATE, O_RDONLY);
-    if (fd == -1)
-        fatal_error("Template read()");
-    read(fd, templ, sizeof(templ));
-    close(fd);
-
-    /* Get guestbook entries and render them as HTML */
-    int entries_count;
-    char **guest_entries;
-    char guest_entries_html[16384]="";
-    redis_get_list(GUESTBOOK_REDIS_REMARKS_KEY, &guest_entries, &entries_count);
-    for (int i = 0; i < entries_count; i++) {
-        char guest_entry[1024];
-        sprintf(guest_entry, "<p class=\"guest-entry\">%s</p>", guest_entries[i]);
-        strcat(guest_entries_html, guest_entry);
+void client_fini(client_context *cc) {
+    client_context *check_cc;
+    HASH_FIND(hh_cs, cc_cs_hash, &cc->client_sock, sizeof(cc->client_sock), check_cc);
+    if (check_cc) {
+        remove_from_poll_fd_list(cc->client_sock);
+        remove_from_poll_fd_list(cc->redis_sock);
+        close(cc->client_sock);
+        close(cc->redis_sock);
+        HASH_DELETE(hh_cs, cc_cs_hash, check_cc);
+        HASH_DELETE(hh_rs, cc_rs_hash, check_cc);
+        free(check_cc);
+    } else {
+        fatal_error("Could not retrieve client context back from hash!\n");
     }
-    redis_free_array_result(guest_entries, entries_count);
+}
 
-    /* In Redis, increment visitor count and fetch latest value */
-    int visitor_count;
-    char visitor_count_str[16]="";
-    redis_incr(GUESTBOOK_REDIS_VISITOR_KEY);
-    redis_get_int_key(GUESTBOOK_REDIS_VISITOR_KEY, &visitor_count);
-    // MEMO: %'dだと3桁ごとにカンマ区切りを入れた文字列にしてくれる
-    sprintf(visitor_count_str, "%'d", visitor_count);
-
-    /* Replace guestbook entries */
-    // MEMO: 文字列を置換したいだけだが、標準にないので頑張って実装。。
-    char *entries = strstr(templ, GUESTBOOK_TMPL_REMARKS);
-    if (entries) {
-        memcpy(rendering, templ, entries-templ); // 置換文字列より前をコピー
-        strcat(rendering, guest_entries_html);
-        char *copy_offset = templ + (entries-templ) + strlen(GUESTBOOK_TMPL_REMARKS); // 置換文字列より後ろをcopy_offsetが差す
-        strcat(rendering, copy_offset);
-        strcpy(templ, rendering);
-        bzero(rendering, sizeof(rendering));
-    }
-
-    /* Replace visitor count */
-    char *vcount = strstr(templ, GUESTBOOK_TMPL_VISITOR);
-    if (vcount) {
-        memcpy(rendering, templ, vcount-templ);
-        strcat(rendering, visitor_count_str);
-        char *copy_offset = templ + (vcount-templ) + strlen(GUESTBOOK_TMPL_VISITOR);
-        strcat(rendering, copy_offset);
-        strcpy(templ, rendering);
-        bzero(rendering, sizeof(rendering));
-    }
-
+void write_template(client_context *cc) {
     /*
      * We've now rendered the template. Send headers and finally the
      * template over to the client.
      * */
     char send_buffer[1024];
+    ssize_t s_ret;
+
     strcpy(send_buffer, "HTTP/1.0 200 OK\r\n");
-    send(client_socket, send_buffer, strlen(send_buffer), 0);
+    s_ret = send(cc->client_sock, send_buffer, strlen(send_buffer), 0);
+    if (s_ret < 0)
+        fatal_error("send()");
     strcpy(send_buffer, SERVER_STRING);
-    send(client_socket, send_buffer, strlen(send_buffer), 0);
+    s_ret = send(cc->client_sock, send_buffer, strlen(send_buffer), 0);
+    if (s_ret < 0)
+        fatal_error("send()");
     strcpy(send_buffer, "Content-Type: text/html\r\n");
-    send(client_socket, send_buffer, strlen(send_buffer), 0);
-    sprintf(send_buffer, "content-length: %ld\r\n", strlen(templ));
-    send(client_socket, send_buffer, strlen(send_buffer), 0);
+    s_ret = send(cc->client_sock, send_buffer, strlen(send_buffer), 0);
+    if (s_ret < 0)
+        fatal_error("send()");
+    sprintf(send_buffer, "content-length: %ld\r\n", strlen(cc->templ));
+    s_ret = send(cc->client_sock, send_buffer, strlen(send_buffer), 0);
+    if (s_ret < 0)
+        fatal_error("send()");
     strcpy(send_buffer, "\r\n");
-    send(client_socket, send_buffer, strlen(send_buffer), 0);
+    s_ret = send(cc->client_sock, send_buffer, strlen(send_buffer), 0);
+    if (s_ret < 0)
+        fatal_error("send()");
+
     // MEMO: ここからresponse bodyを送る
-    send(client_socket, templ, strlen(templ), 0);
-    printf("200 GET /guestbook %ld bytes\n", strlen(templ));
+    s_ret = send(cc->client_sock, cc->templ, strlen(cc->templ), 0);
+    if (s_ret < 0)
+        fatal_error("send()");
+
+    printf("200 GET /guestbook %ld bytes\n", strlen(cc->templ));
+
+    client_fini(cc);
+}
+
+void render_visitor_count(client_context *cc) {
+    char visitor_count_str[16] = "";
+    
+    sprintf(visitor_count_str, "%'d", cc->intval);
+
+    /* Replace visitor count */
+    char *vcount = strstr(cc->templ, GUESTBOOK_TMPL_VISITOR);
+    if (vcount) {
+        memcpy(cc->rendering, cc->templ, vcount - cc->templ);
+        strcat(cc->rendering, visitor_count_str);
+        char *copy_offset = cc->templ + (vcount - cc->templ) + strlen(GUESTBOOK_TMPL_VISITOR);
+        strcat(cc->rendering, copy_offset);
+        strcpy(cc->templ, cc->rendering);
+        memset(cc->rendering, 0, sizeof(cc->rendering));
+    }
+
+    write_template(cc);
+}
+
+void init_fetch_visitor_count(client_context *cc) {
+    cc->next_callback = render_visitor_count;
+    redis_get_int_key(GUESTBOOK_REDIS_VISITOR_KEY, cc);
+}
+
+void bump_visitor_count_callback(client_context *cc) {
+    init_fetch_visitor_count(cc);
+}
+
+void bump_visitor_count(client_context *cc) {
+    cc->next_callback = bump_visitor_count_callback;
+    redis_incr(GUESTBOOK_REDIS_VISITOR_KEY, cc);
+}
+
+void render_guestbook_entries(client_context *cc) {
+    char guest_entries_html[16384]="";
+
+    for (int i = 0; i < cc->entries_count; i++) {
+        char guest_entry[1024];
+        sprintf(guest_entry, "<p class=\"guest-entry\">%s</p>", cc->entries[i]);
+        strcat(guest_entries_html, guest_entry);
+    }
+    redis_free_array_result(cc->entries, cc->entries_count);
+
+    /* Replace guestbook entries */
+    // MEMO: 文字列を置換したいだけだが、標準にないので頑張って実装。。
+    char *entries = strstr(cc->templ, GUESTBOOK_TMPL_REMARKS);
+    if (entries) {
+        memcpy(cc->rendering, cc->templ, entries - cc->templ); // 置換文字列より前をコピー
+        strcat(cc->rendering, guest_entries_html);
+        char *copy_offset = cc->templ + (entries - cc->templ) + strlen(GUESTBOOK_TMPL_REMARKS); // 置換文字列より後ろをcopy_offsetが差す
+        strcat(cc->rendering, copy_offset);
+        strcpy(cc->templ, cc->rendering);
+        memset(cc->rendering, 0, sizeof(cc->rendering));
+    }
+    
+    bump_visitor_count(cc);
 }
 
 
@@ -777,10 +864,22 @@ int render_guestbook_template(int client_socket) {
  * succeeded.
  * */
 void render_guestbook_post_redis_connect(client_context *cc) {
+    // TODO: これは何のために監視しているの？
+    // add_to_poll_fd_list(cc->client_sock, POLLIN);
+    memset(cc->rendering, 0, sizeof(cc->rendering));
+    memset(cc->templ, 0, sizeof(cc->templ));
 
+    /* Read the template file */
+    int fd = open(GUESTBOOK_TEMPLATE, O_RDONLY);
+    if (fd == -1)
+        fatal_error("Template read()");
+    read(fd, cc->templ, sizeof(cc->templ));
+    close(fd);
+
+    /* Get guestbook entries and render them as HTML */
+    cc->next_callback = render_guestbook_entries;
+    redis_get_list(GUESTBOOK_REDIS_REMARKS_KEY, cc);
 }
-
-
 
 
 /*
@@ -801,11 +900,11 @@ int init_render_guestbook_template(int client_sock) {
     if (!cc)
         fatal_error("malloc()");
     cc->client_sock = client_sock;
+    HASH_ADD(hh_cs, cc_cs_hash, client_sock, sizeof(int), cc);
 
     cc->next_callback = render_guestbook_post_redis_connect;
     connect_to_redis_server(cc);
-
-
+    HASH_ADD(hh_rs, cc_rs_hash, redis_sock, sizeof(int), cc);
 }
 
 /*
@@ -893,12 +992,12 @@ void handle_get_method(char *path, int client_sock)
  * should find on the socket is the post data, which forms the body of the request.
  * */
 
-void handle_new_guest_remarks(int client_socket) {
+void handle_new_guest_remarks(int client_sock, int redis_sock) {
     char remarks[1024]="";
     char name[512]="";
     char buffer[4026]="";
     char *c1, *c2;
-    read(client_socket, buffer, sizeof(buffer));
+    read(client_sock, buffer, sizeof(buffer));
     /*
      * Sample data format:
      * guest-remarks=Relatively+great+service&guest-name=Albert+Einstein
@@ -940,7 +1039,7 @@ void handle_new_guest_remarks(int client_socket) {
     /* Validate name and remark lengths and show an error page is required. */
     if (strlen(name) == 0 || strlen(remarks) == 0) {
         char *html = "HTTP/1.0 400 Bad Request\r\ncontent-type: text/html\r\n\r\n<html><title>Error</title><body><p>Error: Do not leave name or remarks empty.</p><p><a href=\"/guestbook\">Go back to Guestbook</a></p></body></html>";
-        write(client_socket, html, strlen(html));
+        write(client_sock, html, strlen(html));
         printf("400 POST /guestbook\n");
         return;
     }
@@ -952,15 +1051,15 @@ void handle_new_guest_remarks(int client_socket) {
      * */
     char *decoded_name = urlencoding_decode(name);
     char *decoded_remarks = urlencoding_decode(remarks);
-    bzero(buffer, sizeof(buffer));
+    memset(buffer, 0, sizeof(buffer));
     sprintf(buffer, "%s - %s", decoded_remarks, decoded_name);
-    redis_list_append(GUESTBOOK_REDIS_REMARKS_KEY, buffer);
+    redis_list_append(GUESTBOOK_REDIS_REMARKS_KEY, buffer, redis_sock);
     free(decoded_name);
     free(decoded_remarks);
 
     /* All good! Show a 'thank you' page. */
     char *html = "HTTP/1.0 200 OK\r\ncontent-type: text/html\r\n\r\n<html><title>Thank you!</title><body><p>Thank you for leaving feedback! We really appreciate that!</p><p><a href=\"/guestbook\">Go back to Guestbook</a></p></body></html>";
-    write(client_socket, html, strlen(html));
+    write(client_sock, html, strlen(html));
     printf("200 POST /guestbook\n");
 }
 
@@ -969,9 +1068,9 @@ void handle_new_guest_remarks(int client_socket) {
  * you start by extending this function to check for your call slug and calling the
  * appropriate handler to deal with the call.
  * */
-int handle_app_post_routes(char *path, int client_socket) {
+int handle_app_post_routes(char *path, int client_socket, int redis_sock) {
     if (strcmp(path, GUESTBOOK_ROUTE) == 0) {
-        handle_new_guest_remarks(client_socket);
+        handle_new_guest_remarks(client_socket, redis_sock);
         return METHOD_HANDLED;
     }
 
@@ -984,8 +1083,11 @@ int handle_app_post_routes(char *path, int client_socket) {
  * only deals with app-related routes.
  * */
 
-void handle_post_method(char *path, int client_socket) {
-    handle_app_post_routes(path, client_socket);
+void handle_post_method(char *path, int client_sock) {
+    int redis_sock = connect_to_redis_server_sync();
+    handle_app_post_routes(path, client_sock, redis_sock);
+    close(redis_sock);
+    close(client_sock);
 }
 
 /*
@@ -1109,16 +1211,26 @@ _Noreturn void enter_server_loop(int server_socket)
                 handle_client(client_socket);
             }
 
-            // MEMO: ソケットがlistening socketじゃない場合 (redis or client connection)
+            // MEMO: ソケットがlistening socketじゃない場合 (redis or client socket)
             if (poll_fds[i].fd != server_socket) {
                 if (!((poll_fds[i].revents & POLLIN) || (poll_fds[i].revents & POLLOUT))) {
                     printf("ERROR: Error condition in socket %d!\n", poll_fds[i].fd);
                     exit(1);
                     continue; // ?
                 }
-                // TODO: this
+
                 /* A descriptor handling one of the clients is ready */
-                // client_context *check_cc;
+                client_context *check_cc;
+                HASH_FIND(hh_cs, cc_cs_hash, &poll_fds[i].fd, sizeof(int), check_cc);
+                if (!check_cc) {
+                    HASH_FIND(hh_rs, cc_rs_hash, &poll_fds[i].fd, sizeof(int), check_cc);
+                    if (!check_cc) {
+                        // printf
+                        fatal_error("Unable to find client context associated with socket.\n");
+                    }
+                }
+
+                check_cc->read_write_callback(check_cc);
             }
         }
     }
