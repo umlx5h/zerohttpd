@@ -18,6 +18,7 @@
 #include <time.h>
 #include <locale.h>
 #include <poll.h>
+#include <stdnoreturn.h>
 #include <errno.h>
 #include "uthash.h"
 
@@ -307,7 +308,7 @@ void redis_get_int_key_callback(client_context *cc) {
 
     char *p = cc->redis_key_buffer;
     if (*p != '$') {
-        printf("Redis protocol error. Wrong number format\n");
+        printf("Redis protocol error. Wrong number format.\n");
         return;
     }
 
@@ -366,7 +367,7 @@ void redis_incr_by(char *key, int incr_by, client_context *cc) {
 
 /* Implies increment by one. Useful addition since this is a common use case. */
 void redis_incr(char *key, client_context *cc) {
-    return redis_incr_by(key, 1, cc);
+    redis_incr_by(key, 1, cc);
 }
 
 /*
@@ -865,7 +866,7 @@ void render_guestbook_entries(client_context *cc) {
  * */
 void render_guestbook_post_redis_connect(client_context *cc) {
     // TODO: これは何のために監視しているの？
-    // add_to_poll_fd_list(cc->client_sock, POLLIN);
+    add_to_poll_fd_list(cc->client_sock, POLLIN);
     memset(cc->rendering, 0, sizeof(cc->rendering));
     memset(cc->templ, 0, sizeof(cc->templ));
 
@@ -914,9 +915,9 @@ int init_render_guestbook_template(int client_sock) {
  * gets precedence over static file serving.
  * */
 
-int handle_app_get_routes(char *path, int client_socket) {
+int handle_app_get_routes(char *path, int client_sock) {
     if (strcmp(path, GUESTBOOK_ROUTE) == 0) {
-        init_render_guestbook_template(client_socket);
+        init_render_guestbook_template(client_sock);
         return METHOD_HANDLED;
     }
 
@@ -1068,9 +1069,9 @@ void handle_new_guest_remarks(int client_sock, int redis_sock) {
  * you start by extending this function to check for your call slug and calling the
  * appropriate handler to deal with the call.
  * */
-int handle_app_post_routes(char *path, int client_socket, int redis_sock) {
+int handle_app_post_routes(char *path, int client_sock, int redis_sock) {
     if (strcmp(path, GUESTBOOK_ROUTE) == 0) {
-        handle_new_guest_remarks(client_socket, redis_sock);
+        handle_new_guest_remarks(client_sock, redis_sock);
         return METHOD_HANDLED;
     }
 
@@ -1196,7 +1197,7 @@ _Noreturn void enter_server_loop(int server_socket)
     while (1) {
         poll_ret = poll(poll_fds, poll_nfds, -1);
         if (poll_ret < 0)
-            fatal_error("poll");
+            fatal_error("poll()");
         
         for (int i = 0; i < poll_nfds; i++) {
             if (poll_fds[i].revents == 0)
