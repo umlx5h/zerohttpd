@@ -17,6 +17,8 @@
 #include <sys/sendfile.h>
 #include <time.h>
 #include <locale.h>
+#include <poll.h>
+#include <errno.h>
 
 #define SERVER_STRING               "Server: zerohttpd/0.1\r\n"
 #define DEFAULT_SERVER_PORT         8000
@@ -63,8 +65,73 @@ const char *http_404_content = \
         "</body>"
         "</html>";
 
-int     redis_socket_fd;
 char    redis_host_ip[32];
+
+
+/*
+ * This whole program runs in a single thread and there are
+ * many reads and writes that need to be tracked per client
+ * connection. The client_context represents a single client
+ * request and it maintains all that is required to fulfill
+ * a single request. A new client_context is allocated for
+ * every new client request and is freed once the request
+ * has been processed.
+ * */
+typedef struct client_context{
+    int client_sock;
+    int redis_sock;
+    char templ[16384];      /* Template storage */
+    char rendering[16384];
+
+    /* Next callback to make to render the page */
+    void (*next_callback)(struct client_context *cc);
+
+
+} client_context;
+
+
+
+/*
+ * These are the 2 variables that poll() uses to present the set of file
+ * descriptors we are interested in watching.
+ * */
+#define POLL_FDS_SZ 10000
+struct pollfd poll_fds[POLL_FDS_SZ];
+nfds_t poll_nfds;
+
+
+
+void add_to_poll_fd_list(int fd, short int events) {
+    poll_fds[poll_nfds].fd = fd;
+    poll_fds[poll_nfds].events = events;
+    poll_nfds++;
+}
+
+/*
+ * The file descriptor we're trying to remove could be in the
+ * beginning, end or anywhere in the middle of the poll_fds
+ * array. We use a temp array to push all entries from the
+ * poll_fds array except the fd we want to remove.
+ *
+ * Finally, we copy the temp array wholesale to the poll_fds
+ * array.
+ * */
+
+void remove_from_poll_fd_list(int fd) {
+    struct pollfd temp_poll_fds[POLL_FDS_SZ];
+    int temp_idx = 0;
+    for (int i = 0; i < poll_nfds; i++) {
+        if (poll_fds[i].fd != fd) {
+            temp_poll_fds[temp_idx].fd = poll_fds[i].fd;
+            temp_poll_fds[temp_idx].events = poll_fds[i].events;
+            temp_poll_fds[temp_idx].revents = poll_fds[i].revents;
+            temp_idx++;
+        }
+    }
+    memcpy(poll_fds, temp_poll_fds, sizeof(struct pollfd) * temp_idx);
+    poll_nfds = temp_idx;
+}
+
 
 /*
  One function that prints the system call and the error details
@@ -82,9 +149,10 @@ void fatal_error(const char *syscall)
  * to the Redis server and store the connected socket in a global variable.
  * */
 
-void connect_to_redis_server() {
+// TODO: delete this
+void connect_to_redis_server_old() {
     struct sockaddr_in redis_servaddr;
-    redis_socket_fd = socket(AF_INET, SOCK_STREAM, 0);
+    int redis_socket_fd = socket(AF_INET, SOCK_STREAM, 0);
     bzero(&redis_servaddr, sizeof(redis_servaddr));
     redis_servaddr.sin_family = AF_INET;
     redis_servaddr.sin_port = htons(REDIS_SERVER_PORT);
@@ -106,6 +174,89 @@ void connect_to_redis_server() {
     else
         printf("Connected to Redis server@ %s:%d\n", redis_host_ip, REDIS_SERVER_PORT);
 }
+
+/*
+ * This callback is called from the main event loop driven by poll()
+ * once a connection to the Redis server is established. See the
+ * connect_to_redis_server() function below. In this function, we
+ * turn the Redis connected socket back into a blocking socket.
+ *
+ * For us blocking sockets are what we need when we need to do reads
+ * and writes. The poll() system call ensures that we do not block.
+ * The only reason we setup a non-blocking socket in the first place
+ * is because we want to avoid connect() from blocking.
+ *
+ * */
+
+void connect_to_redis_server_callback(client_context *cc) {
+    int result;
+    socklen_t result_len = sizeof(result);
+    // MEMO: redisへのconnectのエラーハンドリングをしていると思われる
+    if (getsockopt(cc->redis_sock, SOL_SOCKET, SO_ERROR, &result, &result_len) < 0) {
+        fatal_error("Redis connect getsockopt()");
+    }
+
+    if (result != 0) {
+        fatal_error("Redis connect getsockopt() result");
+    }
+
+    remove_from_poll_fd_list(cc->redis_sock);
+
+    /* Make the redis socket blocking */
+    fcntl(cc->redis_sock, F_SETFL, fcntl(cc->redis_sock, F_GETFL) & ~O_NONBLOCK);
+
+    add_to_poll_fd_list(cc->redis_sock, POLLIN);
+    cc->next_callback(cc);
+}
+
+
+/*
+ * This is the async version of the connect_to_redis_sync() function
+ * implemented earlier. Here, we first setup a non-blocking socket and
+ * use connect() to connect to the Redis server. It is important to
+ * understand that connect() can also take a long time and during
+ * that time, as we block, everything comes to a halt. But not if we
+ * use a non-blocking socket like we're using here. We call connect()
+ * but that does not block, it returns -1, but sets sets errno to
+ * EINPROGRESS. We then add this connecting socket to the descriptors
+ * that poll() is monitoring.
+ *
+ * When the connection is made, poll() wakes up and calls the callback
+ * we've carefully saved in the client_context, which is the
+ * connect_to_redis_server_callback() implemented above.
+ * */
+
+void connect_to_redis_server(client_context *cc) {
+    struct sockaddr_in redis_servaddr;
+    /* Create a non-blocking socket */
+    int redis_socket_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    memset(&redis_servaddr, 0, sizeof(redis_servaddr));
+    redis_servaddr.sin_family = AF_INET;
+    redis_servaddr.sin_port = htons(REDIS_SERVER_PORT);
+
+    int pton_ret = inet_pton(AF_INET, redis_host_ip, &redis_servaddr.sin_addr);
+
+    if (pton_ret < 0)
+        fatal_error("inet_pton()");
+    else if (pton_ret == 0) {
+        fprintf(stderr, "Error: Please provide a valid Redis server IP address.\n");
+        exit(1);
+    }
+
+    int cret = connect(redis_socket_fd,
+                        (struct sockaddr *) &redis_servaddr,
+                        sizeof(redis_servaddr));
+    if (cret == -1 && errno != EINPROGRESS) {
+        fatal_error("redis connect()");
+    } else {
+        cc->redis_sock = redis_socket_fd;
+        cc->read_write_callback = connect_to_redis_server_callback;
+        add_to_poll_fd_list(redis_socket_fd, POLLOUT);
+    }
+
+}
+
+
 
 /*
  * This is an internal function not to be used directly. It send the command to the server,
@@ -320,7 +471,8 @@ int setup_listening_socket(int port) {
     int sock;
     struct sockaddr_in srv_addr;
 
-    sock = socket(PF_INET, SOCK_STREAM, 0);
+    /* Create a non-blocking socket */
+    sock = socket(PF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (sock == -1)
         fatal_error("socket()");
 
@@ -331,7 +483,7 @@ int setup_listening_socket(int port) {
         fatal_error("setsockopt(SO_REUSEADDR)");
 
     // MEMO: getaddrinfoを使わない実装になっている、IPv4決め打ちになっているがgetaddrinfoを使えばIPv6も透過的に対応できる
-    bzero(&srv_addr, sizeof(srv_addr));
+    memset(&srv_addr, 0, sizeof(srv_addr));
     srv_addr.sin_family = AF_INET;
     srv_addr.sin_port = htons(port);
     srv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
@@ -421,6 +573,11 @@ void handle_http_404(int client_socket) {
  * Once a static file is identified to be served, this function is used to read the file
  * and write it over the client socket using Linux's sendfile() system call. This saves us
  * the hassle of transferring file buffers from kernel to user space and back.
+ *
+ * Special note on asychronous file access: under Linux, poll() always claims regular
+ * files are ready for reads or writes. There is no point in adding them to the
+ * descriptors monitored by poll(). Libraries like libuv emulate regular file readiness
+ * monitoring by accesssing them over a separate "I/O" thread. So, we just read.
  * */
 
 void transfer_file_contents(char *file_path, int client_socket, off_t file_size) {
@@ -613,6 +770,44 @@ int render_guestbook_template(int client_socket) {
     printf("200 GET /guestbook %ld bytes\n", strlen(templ));
 }
 
+
+/*
+ * This function is called from the connect_to_redis_server_callback()
+ * function once poll() detects that the new connection to Redis has
+ * succeeded.
+ * */
+void render_guestbook_post_redis_connect(client_context *cc) {
+
+}
+
+
+
+
+/*
+ * The guest book template file is a normal HTML file except two special strings:
+ * $GUEST_REMARKS$ and $VISITOR_COUNT$
+ * In this method, both these special template variables are replaced by content
+ * generated by us. And that content is based on stuff we retrieve from Redis.
+ *
+ * In this async version, we setup the next_callback in the client context object
+ * and call connect_to_redis_server(). Here we also add both the client socket and
+ * the Redis socket to hash tables so that we can retrieve the client context given
+ * either the Redis socket or the client socket in the main poll() event loop.
+ * */
+
+int init_render_guestbook_template(int client_sock) {
+    /* This is a new connection. Allocate a client context. */
+    client_context *cc = malloc(sizeof(client_context));
+    if (!cc)
+        fatal_error("malloc()");
+    cc->client_sock = client_sock;
+
+    cc->next_callback = render_guestbook_post_redis_connect;
+    connect_to_redis_server(cc);
+
+
+}
+
 /*
  * If we are not serving static files and we want to write web apps, this is the place
  * to add more routes. If this function returns METHOD_NOT_HANDLED, the request is
@@ -622,7 +817,7 @@ int render_guestbook_template(int client_socket) {
 
 int handle_app_get_routes(char *path, int client_socket) {
     if (strcmp(path, GUESTBOOK_ROUTE) == 0) {
-        render_guestbook_template(client_socket);
+        init_render_guestbook_template(client_socket);
         return METHOD_HANDLED;
     }
 
@@ -634,12 +829,12 @@ int handle_app_get_routes(char *path, int client_socket) {
  * look for static files or index files inside of directories.
  * */
 
-void handle_get_method(char *path, int client_socket)
+void handle_get_method(char *path, int client_sock)
 {
     char final_path[1024];
 
     // MEMO: 動的HTMLはここを通る
-    if (handle_app_get_routes(path, client_socket) == METHOD_HANDLED)
+    if (handle_app_get_routes(path, client_sock) == METHOD_HANDLED)
         return;
 
     // MEMO: 以下静的ファイルを配信
@@ -665,20 +860,20 @@ void handle_get_method(char *path, int client_socket)
     if (stat(final_path, &path_stat) == -1)
     {
         printf("404 Not Found: %s\n", final_path);
-        handle_http_404(client_socket);
+        handle_http_404(client_sock);
     }
     else
     {
         /* Check if this is a normal/regular file and not a directory or something else */
         if (S_ISREG(path_stat.st_mode))
         {
-            send_headers(final_path, path_stat.st_size, client_socket);
-            transfer_file_contents(final_path, client_socket, path_stat.st_size);
+            send_headers(final_path, path_stat.st_size, client_sock);
+            transfer_file_contents(final_path, client_sock, path_stat.st_size);
             printf("200 %s %ld bytes\n", final_path, path_stat.st_size);
         }
         else
         {
-            handle_http_404(client_socket);
+            handle_http_404(client_sock);
             printf("404 Not Found: %s\n", final_path);
         }
     }
@@ -799,7 +994,7 @@ void handle_post_method(char *path, int client_socket) {
  * in case both these don't match. This sends an error to the client.
  * */
 
-void handle_http_method(char *method_buffer, int client_socket)
+void handle_http_method(char *method_buffer, int client_sock)
 {
     // MEMO: method_bufferはスタックに確保されているがそれを参照するポインタ
     char *method, *path;
@@ -813,15 +1008,15 @@ void handle_http_method(char *method_buffer, int client_socket)
 
     if (strcmp(method, "get") == 0)
     {
-        handle_get_method(path, client_socket);
+        handle_get_method(path, client_sock);
     }
     else if (strcmp(method, "post") == 0) {
 
-        handle_post_method(path, client_socket);
+        handle_post_method(path, client_sock);
     }
     else
     {
-        handle_unimplemented_method(client_socket);
+        handle_unimplemented_method(client_sock);
     }
 }
 
@@ -831,7 +1026,7 @@ void handle_http_method(char *method_buffer, int client_socket)
  * are read and discarded since we do not deal with them.
  * */
 
-void handle_client(int client_socket)
+void handle_client(int client_sock)
 {
     char line_buffer[1024];
     char method_buffer[1024];
@@ -839,7 +1034,7 @@ void handle_client(int client_socket)
 
     while (1)
     {
-        get_line(client_socket, line_buffer, sizeof(line_buffer));
+        get_line(client_sock, line_buffer, sizeof(line_buffer));
         method_line++;
 
         // TODO: get_lineの戻り値と同じなのでいらない説
@@ -864,31 +1059,68 @@ void handle_client(int client_socket)
         }
     }
 
-    handle_http_method(method_buffer, client_socket);
+    handle_http_method(method_buffer, client_sock);
 }
 
 /*
- * This function is the main server loop. It never returns. In a loop, it accepts client
- * connections and calls handle_client() to serve the request. Once the request is served,
- * it closes the client connection and goes back to waiting for a new client connection,
- * calling accept() again.
+ * This is the beating heart of this program - our poll()-based event loop.
+ *
+ * When poll() returns normally, there are 3 possibilities:
+ *
+ * 1. we got a new connection on the server socket. Remember that we've
+ * setup our server socket to be non-blocking, meaning that accept() in this
+ * loop won't block. When poll() tells us that there is activity in the server
+ * socket, it might be that there are several queued new client connections.
+ * Since accept() is non-blocking, we call it multiple times. If it returns
+ * a non-zero value, it means a client connection was accepted. We then call
+ * handle_client() that starts the function call chain that ends in client_fini()
+ *
+ * 2. We can read one of the client sockets without blocking
+ * 3. We can read one of the Redis sockets without blocking
+ *
+ * In either of these cases, we find out the corresponding client_context
+ * structure and call the next callback stored in the function pointer
+ * read_write_callback, passing in the client_context. This can be tricky to
+ * understand. Please read the accompanying article series on unixism.net.
+ *
  * */
 
-void enter_server_loop(int server_socket)
+_Noreturn void enter_server_loop(int server_socket)
 {
+    int poll_ret;
     struct sockaddr_in client_addr;
     socklen_t client_addr_len = sizeof(client_addr);
-    while (1)
-    {
-        int client_socket = accept(
-                server_socket,
-                (struct sockaddr *)&client_addr,
-                &client_addr_len);
-        if (client_socket == -1)
-            fatal_error("accept()");
 
-        handle_client(client_socket);
-        close(client_socket);
+    while (1) {
+        poll_ret = poll(poll_fds, poll_nfds, -1);
+        if (poll_ret < 0)
+            fatal_error("poll");
+        
+        for (int i = 0; i < poll_nfds; i++) {
+            if (poll_fds[i].revents == 0)
+                continue;
+            
+            int client_socket = accept(
+                    server_socket,
+                    (struct sockaddr *)&client_addr,
+                    &client_addr_len);
+            
+            if (client_socket > 0) {
+                handle_client(client_socket);
+            }
+
+            // MEMO: ソケットがlistening socketじゃない場合 (redis or client connection)
+            if (poll_fds[i].fd != server_socket) {
+                if (!((poll_fds[i].revents & POLLIN) || (poll_fds[i].revents & POLLOUT))) {
+                    printf("ERROR: Error condition in socket %d!\n", poll_fds[i].fd);
+                    exit(1);
+                    continue; // ?
+                }
+                // TODO: this
+                /* A descriptor handling one of the clients is ready */
+                // client_context *check_cc;
+            }
+        }
     }
 }
 
@@ -901,19 +1133,25 @@ void enter_server_loop(int server_socket)
  * */
 
 void print_stats(int signo) {
-    struct rusage rusagebuf;
-    getrusage(RUSAGE_SELF, &rusagebuf);
-    printf("\nUser time: %lds %ldms, System time: %lds %ldms\n",
-            rusagebuf.ru_utime.tv_sec, rusagebuf.ru_utime.tv_usec/1000,
-            rusagebuf.ru_stime.tv_sec, rusagebuf.ru_stime.tv_usec/1000);
+    double          user, sys;
+    struct rusage   myusage;
+
+    if (getrusage(RUSAGE_SELF, &myusage) < 0)
+        fatal_error("getrusage()");
+
+    user = (double) myusage.ru_utime.tv_sec +
+                    myusage.ru_utime.tv_usec/1000000.0;
+    sys = (double) myusage.ru_stime.tv_sec +
+                   myusage.ru_stime.tv_usec/1000000.0;
+
+    printf("\nuser time = %g, sys time = %g\n", user, sys);
     exit(0);
 }
 
 /*
- * Our main function is fairly simple. I sets up the listening socket, establishes
- * a connection to Redis, which we use to host our Guestbook app, sets up a signal
- * handler for SIGINT and finally calls enter_server_loop(), which accepts and
- * serves client requests.
+ * Our main function is fairly simple. I sets up the listening socket, sets up 
+ * a signal handler for SIGINT and finally calls enter_server_loop(), which 
+ * starts the event loop based on poll().
  * */
 
 int main(int argc, char *argv[])
@@ -928,16 +1166,21 @@ int main(int argc, char *argv[])
         strcpy(redis_host_ip, argv[2]);
     else
         strcpy(redis_host_ip, REDIS_SERVER_HOST);
+    
+    printf("Configured to connect to Redis @%s:%d\n", redis_host_ip, REDIS_SERVER_PORT);
 
     int server_socket = setup_listening_socket(server_port);
 
-    connect_to_redis_server();
     /* Setting the locale and using the %' escape sequence lets us format
-     * numbers with commas */
+     * large numbers with commas */
     setlocale(LC_NUMERIC, "");
     printf("ZeroHTTPd server listening on port %d\n", server_port);
     signal(SIGINT, print_stats);
     signal(SIGPIPE, SIG_IGN); // コネクションが切断された時に終了しないようにする
+
+    add_to_poll_fd_list(server_socket, POLLIN);
     enter_server_loop(server_socket);
+
+    /* Never reaches this point */
     return (0);
 }
