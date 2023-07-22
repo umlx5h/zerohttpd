@@ -13,7 +13,10 @@ threaded: 04_threaded/main.c
 prethreaded: 05_prethreaded/main.c
 	gcc -g -o $@ $<
 
+poll: 06_poll/main.c
+	gcc -g -o $@ $<
+
 .PHONY: clean
 
 clean:
-	rm -f iterative forking preforked threaded prethreaded
+	rm -f iterative forking preforked threaded prethreaded poll
