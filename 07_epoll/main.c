@@ -17,7 +17,7 @@
 #include <sys/sendfile.h>
 #include <time.h>
 #include <locale.h>
-#include <poll.h>
+#include <sys/epoll.h>
 #include <stdnoreturn.h>
 #include <errno.h>
 #include "uthash.h"
@@ -101,13 +101,10 @@ typedef struct client_context{
     UT_hash_handle hh_rs;  /* Lookup by Redis socket */
 } client_context;
 
-/*
- * These are the 2 variables that poll() uses to present the set of file
- * descriptors we are interested in watching.
- * */
-#define POLL_FDS_SZ 10000
-struct pollfd poll_fds[POLL_FDS_SZ];
-nfds_t poll_nfds;
+int epoll_fd;
+#define MAX_EVENTS 32000
+struct epoll_event events[MAX_EVENTS];
+
 
 /*
  * Hash tables that allow us to look up the client_context
@@ -115,39 +112,6 @@ nfds_t poll_nfds;
  * */
 client_context *cc_cs_hash = NULL;
 client_context *cc_rs_hash = NULL;
-
-
-void add_to_poll_fd_list(int fd, short int events) {
-    poll_fds[poll_nfds].fd = fd;
-    poll_fds[poll_nfds].events = events;
-    poll_nfds++;
-}
-
-/*
- * The file descriptor we're trying to remove could be in the
- * beginning, end or anywhere in the middle of the poll_fds
- * array. We use a temp array to push all entries from the
- * poll_fds array except the fd we want to remove.
- *
- * Finally, we copy the temp array wholesale to the poll_fds
- * array.
- * */
-
-void remove_from_poll_fd_list(int fd) {
-    struct pollfd temp_poll_fds[POLL_FDS_SZ];
-    int temp_idx = 0;
-    for (int i = 0; i < poll_nfds; i++) {
-        if (poll_fds[i].fd != fd) {
-            temp_poll_fds[temp_idx].fd = poll_fds[i].fd;
-            temp_poll_fds[temp_idx].events = poll_fds[i].events;
-            temp_poll_fds[temp_idx].revents = poll_fds[i].revents;
-            temp_idx++;
-        }
-    }
-    memcpy(poll_fds, temp_poll_fds, sizeof(struct pollfd) * temp_idx);
-    poll_nfds = temp_idx;
-}
-
 
 /*
  One function that prints the system call and the error details
@@ -157,6 +121,19 @@ void fatal_error(const char *syscall)
 {
     perror(syscall);
     exit(1);
+}
+
+void add_to_epoll_fd_list(int fd, uint32_t ep_events) {
+    struct epoll_event event;
+    event.data.fd = fd;
+    event.events = ep_events;
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &event))
+        fatal_error("add epoll_ctl()");
+}
+
+void remove_from_epoll_fd_list(int fd) {
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL))
+        fatal_error("remove epoll_ctl()");
 }
 
 /*
@@ -193,13 +170,13 @@ int connect_to_redis_server_sync() {
 }
 
 /*
- * This callback is called from the main event loop driven by poll()
+ * This callback is called from the main event loop driven by epoll_wait()
  * once a connection to the Redis server is established. See the
  * connect_to_redis_server() function below. In this function, we
  * turn the Redis connected socket back into a blocking socket.
  *
  * For us blocking sockets are what we need when we need to do reads
- * and writes. The poll() system call ensures that we do not block.
+ * and writes. The epoll_wait() system call ensures that we do not block.
  * The only reason we setup a non-blocking socket in the first place
  * is because we want to avoid connect() from blocking.
  *
@@ -217,12 +194,12 @@ void connect_to_redis_server_callback(client_context *cc) {
         fatal_error("Redis connect getsockopt() result");
     }
 
-    remove_from_poll_fd_list(cc->redis_sock);
+    remove_from_epoll_fd_list(cc->redis_sock);
 
     /* Make the redis socket blocking */
     fcntl(cc->redis_sock, F_SETFL, fcntl(cc->redis_sock, F_GETFL) & ~O_NONBLOCK);
 
-    add_to_poll_fd_list(cc->redis_sock, POLLIN);
+    add_to_epoll_fd_list(cc->redis_sock, EPOLLIN);
     cc->next_callback(cc);
 }
 
@@ -236,9 +213,9 @@ void connect_to_redis_server_callback(client_context *cc) {
  * use a non-blocking socket like we're using here. We call connect()
  * but that does not block, it returns -1, but sets sets errno to
  * EINPROGRESS. We then add this connecting socket to the descriptors
- * that poll() is monitoring.
+ * that epoll_wait() is monitoring.
  *
- * When the connection is made, poll() wakes up and calls the callback
+ * When the connection is made, epoll_wait() wakes up and calls the callback
  * we've carefully saved in the client_context, which is the
  * connect_to_redis_server_callback() implemented above.
  * */
@@ -268,7 +245,7 @@ void connect_to_redis_server(client_context *cc) {
     } else {
         cc->redis_sock = redis_socket_fd;
         cc->read_write_callback = connect_to_redis_server_callback;
-        add_to_poll_fd_list(redis_socket_fd, POLLOUT);
+        add_to_epoll_fd_list(redis_socket_fd, EPOLLOUT);
     }
 }
 
@@ -277,7 +254,7 @@ void connect_to_redis_server(client_context *cc) {
 /*
  * One note about writes: we never check if we will block. We simply
  * write. We mainly worry about the time we might spend blocked on
- * connect() and read(). Both these, we track with poll()
+ * connect() and read(). Both these, we track with epoll_wait()
  * */
 ssize_t redis_write(int fd, char *buf, ssize_t length) {
     ssize_t n_written = write(fd, buf, length);
@@ -622,12 +599,11 @@ void handle_http_404(int client_socket) {
  * and write it over the client socket using Linux's sendfile() system call. This saves us
  * the hassle of transferring file buffers from kernel to user space and back.
  *
- * Special note on asychronous file access: under Linux, poll() always claims regular
- * files are ready for reads or writes. There is no point in adding them to the
- * descriptors monitored by poll(). Libraries like libuv emulate regular file readiness
+ * Special note on asychronous file access: under Linux, poll()/epoll claim regular
+ * files are ready for reads or writes at all times. There is no point in adding them to the
+ * descriptors monitored by epoll_wait(). Libraries like libuv emulate regular file readiness
  * monitoring by accesssing them over a separate "I/O" thread. So, we just read.
  * */
-
 void transfer_file_contents(char *file_path, int client_socket, off_t file_size) {
     int fd;
 
@@ -749,12 +725,12 @@ void client_fini(client_context *cc) {
     client_context *check_cc;
     HASH_FIND(hh_cs, cc_cs_hash, &cc->client_sock, sizeof(cc->client_sock), check_cc);
     if (check_cc) {
-        remove_from_poll_fd_list(cc->client_sock);
-        remove_from_poll_fd_list(cc->redis_sock);
-        close(cc->client_sock);
-        close(cc->redis_sock);
         HASH_DELETE(hh_cs, cc_cs_hash, check_cc);
         HASH_DELETE(hh_rs, cc_rs_hash, check_cc);
+        remove_from_epoll_fd_list(cc->client_sock);
+        remove_from_epoll_fd_list(cc->redis_sock);
+        close(cc->client_sock);
+        close(cc->redis_sock);
         free(check_cc);
     } else {
         fatal_error("Could not retrieve client context back from hash!\n");
@@ -861,12 +837,12 @@ void render_guestbook_entries(client_context *cc) {
 
 /*
  * This function is called from the connect_to_redis_server_callback()
- * function once poll() detects that the new connection to Redis has
+ * function once epoll_wait() detects that the new connection to Redis has
  * succeeded.
  * */
 void render_guestbook_post_redis_connect(client_context *cc) {
     // TODO: これは何のために監視しているの？
-    add_to_poll_fd_list(cc->client_sock, POLLIN);
+    add_to_epoll_fd_list(cc->client_sock, EPOLLIN);
     memset(cc->rendering, 0, sizeof(cc->rendering));
     memset(cc->templ, 0, sizeof(cc->templ));
 
@@ -892,7 +868,7 @@ void render_guestbook_post_redis_connect(client_context *cc) {
  * In this async version, we setup the next_callback in the client context object
  * and call connect_to_redis_server(). Here we also add both the client socket and
  * the Redis socket to hash tables so that we can retrieve the client context given
- * either the Redis socket or the client socket in the main poll() event loop.
+ * either the Redis socket or the client socket in the main epoll_wait() event loop.
  * */
 
 int init_render_guestbook_template(int client_sock) {
@@ -1166,20 +1142,19 @@ void handle_client(int client_sock)
 }
 
 /*
- * This is the beating heart of this program - our poll()-based event loop.
+ * This is the beating heart of this program - our epoll_wait()-based event loop.
  *
- * When poll() returns normally, there are 3 possibilities:
+ * When epoll_wait() returns normally, there are 3 possibilities:
  *
- * 1. we got a new connection on the server socket. Remember that we've
+ * #1. we got a new connection on the server socket. Remember that we've
  * setup our server socket to be non-blocking, meaning that accept() in this
- * loop won't block. When poll() tells us that there is activity in the server
+ * loop won't block. When epoll_wait() tells us that there is activity in the server
  * socket, it might be that there are several queued new client connections.
  * Since accept() is non-blocking, we call it multiple times. If it returns
  * a non-zero value, it means a client connection was accepted. We then call
  * handle_client() that starts the function call chain that ends in client_fini()
- *
- * 2. We can read one of the client sockets without blocking
- * 3. We can read one of the Redis sockets without blocking
+ * #2. We can read one of the client sockets without blocking
+ * #3. We can read one of the Redis sockets without blocking
  *
  * In either of these cases, we find out the corresponding client_context
  * structure and call the next callback stored in the function pointer
@@ -1190,17 +1165,17 @@ void handle_client(int client_sock)
 
 _Noreturn void enter_server_loop(int server_socket)
 {
-    int poll_ret;
+    int epoll_ret;
     struct sockaddr_in client_addr;
     socklen_t client_addr_len = sizeof(client_addr);
 
     while (1) {
-        poll_ret = poll(poll_fds, poll_nfds, -1);
-        if (poll_ret < 0)
-            fatal_error("poll()");
+        epoll_ret = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
+        if (epoll_ret < 0)
+            fatal_error("epoll_wait()");
         
-        for (int i = 0; i < poll_nfds; i++) {
-            if (poll_fds[i].revents == 0)
+        for (int i = 0; i < epoll_ret; i++) {
+            if (events[i].events == 0)
                 continue;
             
             int client_socket = accept(
@@ -1213,21 +1188,21 @@ _Noreturn void enter_server_loop(int server_socket)
             }
 
             // MEMO: ソケットがlistening socketじゃない場合 (redis or client socket)
-            if (poll_fds[i].fd != server_socket) {
-                if (!((poll_fds[i].revents & POLLIN) || (poll_fds[i].revents & POLLOUT))) {
-                    printf("ERROR: Error condition in socket %d!\n", poll_fds[i].fd);
+            if (events[i].data.fd != server_socket) {
+                if (!((events[i].events & EPOLLIN) || (events[i].events & EPOLLOUT))) {
+                    printf("ERROR: Error condition in socket %d!\n", events[i].data.fd);
                     exit(1);
                     continue; // ?
                 }
 
                 /* A descriptor handling one of the clients is ready */
                 client_context *check_cc;
-                HASH_FIND(hh_cs, cc_cs_hash, &poll_fds[i].fd, sizeof(int), check_cc);
+                HASH_FIND(hh_cs, cc_cs_hash, &events[i].data.fd, sizeof(int), check_cc);
                 if (!check_cc) {
-                    HASH_FIND(hh_rs, cc_rs_hash, &poll_fds[i].fd, sizeof(int), check_cc);
+                    HASH_FIND(hh_rs, cc_rs_hash, &events[i].data.fd, sizeof(int), check_cc);
                     if (!check_cc) {
-                        // printf
-                        fatal_error("Unable to find client context associated with socket.\n");
+                        printf("Unable to find client context associated with socket %d.\n", events[i].data.fd);
+                        exit(1);
                     }
                 }
 
@@ -1236,6 +1211,31 @@ _Noreturn void enter_server_loop(int server_socket)
         }
     }
 }
+
+typedef struct {
+    unsigned long size,resident,share,text,lib,data,dt;
+} statm_t;
+
+void read_memory_stats(statm_t *result)
+{
+    const char* statm_path = "/proc/self/statm";
+
+    FILE *f = fopen(statm_path,"r");
+    if(!f){
+        perror(statm_path);
+        abort();
+    }
+    if(7 != fscanf(f,"%ld %ld %ld %ld %ld %ld %ld",
+                   &result->size, &result->resident,
+                   &result->share,&result->text,
+                   &result->lib,&result->data,&result->dt))
+    {
+        perror(statm_path);
+        abort();
+    }
+    fclose(f);
+}
+
 
 /*
  * When Ctrl-C is pressed on the terminal, the shell sends our process SIGINT. This is the
@@ -1263,8 +1263,8 @@ void print_stats(int signo) {
 
 /*
  * Our main function is fairly simple. I sets up the listening socket, sets up 
- * a signal handler for SIGINT and finally calls enter_server_loop(), which 
- * starts the event loop based on poll().
+ * a signal handler for SIGINT, creates a epoll descriptor and finally calls 
+ * enter_server_loop(), which starts our main event loop based on epoll_wait()
  * */
 
 int main(int argc, char *argv[])
@@ -1291,7 +1291,11 @@ int main(int argc, char *argv[])
     signal(SIGINT, print_stats);
     signal(SIGPIPE, SIG_IGN); // コネクションが切断された時に終了しないようにする
 
-    add_to_poll_fd_list(server_socket, POLLIN);
+    epoll_fd = epoll_create1(0);
+    if (epoll_fd < 0)
+        fatal_error("epoll_create1()");
+
+    add_to_epoll_fd_list(server_socket, EPOLLIN);
     enter_server_loop(server_socket);
 
     /* Never reaches this point */

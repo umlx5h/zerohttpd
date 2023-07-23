@@ -16,7 +16,7 @@ prethreaded: 05_prethreaded/main.c
 poll: 06_poll/main.c
 	gcc -g -o $@ $<
 
-epoll: 06_epoll/main.c
+epoll: 07_epoll/main.c
 	gcc -g -o $@ $<
 
 .PHONY: clean
